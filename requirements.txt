@@ -1,0 +1,34 @@
+# ---- Backend (Phase 1) ----
+fastapi
+uvicorn[standard]
+pydantic
+python-dotenv
+httpx            # also the LLM transport -- see backend/llm/http_provider.py
+
+# ---- Orchestration (Phase 2) ----
+langgraph>=0.2
+
+# ---- Testing ----
+pytest
+
+# ---- Governance (X-Verba / VSL) -- PHASE 4, INSTALLED ----
+#
+# Installation traps, recorded because each one fails quietly:
+#
+#   1. The distribution is `super-semantics-vsl`; the IMPORT is `vsl_core`.
+#      `pip install vsl-core` installs an unrelated PyPI stub and every import
+#      below then resolves to the wrong package.
+#   2. There are no releases or tags, so the commit SHA is pinned.
+#   3. vsl-langgraph pins its vsl-core dependency to a stale URL that conflicts
+#      with the line below. It MUST be installed separately with --no-deps,
+#      after this file, against the vsl_core already installed here.
+
+super-semantics-vsl @ git+https://github.com/supersemantics/VSL-Core.git@0f8d10ee6a1679dd1bedd06cebb7c23e09557329
+
+# Then, as a second command (it cannot go in this file -- --no-deps is per-install):
+#
+#   pip install --no-deps "vsl-langgraph @ git+https://github.com/supersemantics/VSL-Langgraph.git@d2f4b736c8e321d236e955622a71f7a9c02981ee"
+#
+# Verify both resolved correctly:
+#   python -c "import vsl_core, vsl_langgraph; print('ok')"
+#   python -m governance.audit_cli conformance      # expects CONFORMANT
