@@ -232,6 +232,20 @@ class FieldSpec:
     required: bool = True
     label: str = ""
 
+    free_text: bool = False
+    """Does a valid answer to this field look like a paragraph?
+
+    Almost nothing does. A name, a postcode, a phone number and a suburb are all
+    a handful of words, so a five-sentence paragraph offered as one of them is
+    not an answer that failed validation -- it is text that was never an answer
+    at all, and the extraction layer should not hand it to a validator hoping
+    for the best. `incident_description` is the one field where a paragraph IS
+    the right answer.
+
+    This is a ROUTING fact, not a validation rule: it decides which field a
+    piece of text could be about. `validate` still decides whether the text is
+    acceptable, and neither loosens the other."""
+
     def display(self) -> str:
         return self.label or self.name.replace("_", " ").capitalize()
 
@@ -281,6 +295,7 @@ FIELDS: tuple[FieldSpec, ...] = (
         "Could you describe what happened, in your own words?",
         validate_description,
         label="What happened",
+        free_text=True,
     ),
     FieldSpec(
         "address_line_1",

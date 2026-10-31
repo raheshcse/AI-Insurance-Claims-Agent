@@ -32,7 +32,7 @@ export default function App() {
         <div className="masthead__inner">
           <div className="brand">
             <span className="brand__mark" aria-hidden="true" />
-            <span className="brand__name">Northwind Home Insurance</span>
+            <span className="brand__name">Insurance Claims</span>
           </div>
 
           <nav className="viewswitch" aria-label="Demonstration views">
@@ -85,9 +85,9 @@ export default function App() {
       <footer className="footer">
         <div className="footer__inner">
           <p>
-            Proof of concept — synthetic data only. Northwind Home Insurance is a fictional
-            insurer used for demonstration. AI output is analysis and recommendation only;
-            no claim is approved, declined or settled by this system.
+            Proof of concept — synthetic data only. No real insurer, customer, policy or
+            claim data is used. AI output is analysis and recommendation only; no claim is
+            approved, declined or settled by this system.
           </p>
         </div>
       </footer>

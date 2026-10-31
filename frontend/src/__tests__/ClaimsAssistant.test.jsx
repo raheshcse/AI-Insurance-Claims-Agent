@@ -22,8 +22,8 @@ const AUTHORITY_NOTE =
   'not approve, decline or settle a claim — a claims specialist decides that.'
 
 const OPENING =
-  "Hello. I'm the Northwind claims assistant. Tell me what happened in your " +
-  "own words and I'll help you report it — you don't need to fill in a form."
+  "Hello! I'm your insurance claims assistant. Tell me what happened, and " +
+  "I'll help you report it."
 
 function conversation(overrides = {}) {
   return {

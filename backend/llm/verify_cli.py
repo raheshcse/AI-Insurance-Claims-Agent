@@ -41,7 +41,7 @@ import time
 from typing import Any
 
 from bootstrap import DOTENV_PATH, load_project_env, mask_secret
-from llm.base import NarrationRequest
+from llm.base import DegradedReason, NarrationRequest
 from llm.factory import get_llm_provider
 from llm.gemini_provider import API_KEY_ENV
 
@@ -72,14 +72,90 @@ def _key_state(provider_name: str) -> dict[str, Any]:
     `masked` shows the last four characters only -- enough to tell two keys
     apart when you are looking at the wrong one, not enough to use.
     """
+    if provider_name == "ollama":
+        # A local server authenticates nothing. Reporting some OTHER provider's
+        # key as "not configured" here would be a false alarm about a
+        # credential this provider must never have.
+        return {
+            "env_var": None,
+            "required": False,
+            "configured": None,
+            "length": 0,
+            "masked": "(not required — local provider)",
+        }
+
     env_var = API_KEY_ENV if provider_name == "gemini" else "OPENAI_API_KEY"
     raw = os.environ.get(env_var, "")
     return {
         "env_var": env_var,
+        "required": True,
         "configured": bool(raw),
         "length": len(raw),  # a length is not a credential; a prefix would be
         "masked": mask_secret(raw),
     }
+
+
+LIVE_PROBE = NarrationRequest(
+    purpose="connectivity check",
+    facts={"instruction": "Respond with exactly: LLM_CONNECTION_OK"},
+    max_words=10,
+    system_instruction=(
+        "You are a connectivity probe. Reply with exactly the text "
+        "LLM_CONNECTION_OK and nothing else."
+    ),
+)
+"""The smallest request that proves the integration end to end.
+
+No customer information, no claim data, no policy detail -- it has to be safe to
+run against a production key on someone else's machine, and "safe" means there
+is nothing in it worth leaking."""
+
+
+_ACTIONS: dict[str, str] = {
+    DegradedReason.NOT_CONFIGURED: "Set GEMINI_API_KEY in .env at the project root.",
+    DegradedReason.MODEL_NOT_FOUND: (
+        "The server is running but does not have this model. Pull it: "
+        "`ollama pull $OLLAMA_MODEL`, or check OLLAMA_MODEL."
+    ),
+    DegradedReason.AUTH_REJECTED: (
+        "The key was refused. Check it is current, unrestricted, and that the "
+        "Generative Language API is enabled for its project."
+    ),
+    DegradedReason.NOT_FOUND: (
+        "No such endpoint or model. Check the provider's model and base URL."
+    ),
+    DegradedReason.RATE_LIMITED: (
+        "Quota or rate limit reached. The integration itself is working."
+    ),
+    DegradedReason.BAD_REQUEST: (
+        "The API refused the request body. This is a bug in the provider, not "
+        "in your configuration."
+    ),
+    DegradedReason.PROVIDER_ERROR: "The provider returned a server error. Retry later.",
+    DegradedReason.TIMEOUT: (
+        "No answer in time. Raise the provider's request timeout -- a local "
+        "model on a CPU is simply slow, not broken."
+    ),
+    DegradedReason.CONNECTION_FAILED: (
+        "The endpoint could not be reached at all. For a hosted API: DNS, TLS, "
+        "a firewall or a proxy. For Ollama: is `ollama serve` running?"
+    ),
+    DegradedReason.INVALID_JSON: (
+        "A body came back that is not one JSON document. Usually a proxy "
+        "answering instead of the API, or a streamed reply."
+    ),
+    DegradedReason.UNUSABLE_STATUS: (
+        "The API answered with a status carrying no result. Retry."
+    ),
+    DegradedReason.EMPTY_RESPONSE: (
+        "A 200 with no text, usually a safety filter. Nothing is misconfigured."
+    ),
+}
+
+
+def _what_to_do(reason: str | None) -> str:
+    """One sentence naming the next action. Never a credential."""
+    return _ACTIONS.get(reason or "", "Run with --live for a minimal probe.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,14 +169,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Override LLM_PROVIDER for this check (e.g. gemini, stub, openai).",
     )
     parser.add_argument("--json", action="store_true", help="Machine-readable output")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "Send a minimal connectivity probe instead of a sample narration. "
+            "No claim data is included."
+        ),
+    )
     args = parser.parse_args(argv)
 
     dotenv_loaded = load_project_env()
     provider = get_llm_provider(args.provider)
     key = _key_state(provider.name)
 
+    probe = LIVE_PROBE if args.live else SAMPLE
     started = time.perf_counter()
-    result = provider.narrate(SAMPLE)
+    result = provider.narrate(probe)
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
 
     live = not result.degraded and provider.name != "stub"
@@ -108,8 +193,11 @@ def main(argv: list[str] | None = None) -> int:
     payload = {
         "provider": result.provider,
         "model": result.model,
+        "provider_selected": provider.name,
+        "request_succeeded": not result.degraded,
         "degraded": result.degraded,
         "degraded_reason": result.degraded_reason,
+        "http_status": result.http_status,
         "live_model_answered": live,
         "latency_ms": elapsed_ms,
         "api_key": key,
@@ -136,14 +224,23 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  model             {result.model or '(none — deterministic stub)'}")
     if payload["endpoint"]:
         print(f"  endpoint          {payload['endpoint']}")
-    print(
-        f"  {key['env_var']:<17} "
-        + (
-            f"configured: true  {key['masked']}  ({key['length']} chars)"
-            if key["configured"]
-            else "configured: false"
+    if key.get("required") is False:
+        print(f"  {'credential':<17} {key['masked']}")
+    else:
+        print(
+            f"  {key['env_var']:<17} "
+            + (
+                f"configured: true  {key['masked']}  ({key['length']} chars)"
+                if key["configured"]
+                else "configured: false"
+            )
         )
-    )
+
+    # For a local provider, whether the SERVER is up and has the model is the
+    # question that matters, and it can be answered without spending inference.
+    if hasattr(provider, "available"):
+        ok, why = provider.available()
+        print(f"  server reachable  {'yes' if ok else 'no'}" + ("" if ok else f"  ({why})"))
     print(f"  round trip        {elapsed_ms} ms")
     print()
 
@@ -158,14 +255,12 @@ def main(argv: list[str] | None = None) -> int:
         print("                    the analysis result will report llm_degraded=true.")
         if result.degraded_reason:
             print(f"                    Reason code: {result.degraded_reason}")
-        if not key["configured"]:
-            print(f"                    Cause: {key['env_var']} is not set.")
-            if not DOTENV_PATH.is_file():
-                print("                    There is also no .env file at the path above.")
-        else:
-            print("                    Cause: the endpoint was unreachable, refused the")
-            print("                    key, or returned nothing usable. Run the backend")
-            print("                    and read the claims.llm log line for the class.")
+        if result.http_status:
+            print(f"                    HTTP status: {result.http_status}")
+        for line in _wrap(_what_to_do(result.degraded_reason), 54):
+            print(f"                    {line}")
+        if not key["configured"] and not DOTENV_PATH.is_file():
+            print("                    There is also no .env file at the path above.")
 
     print()
     print("  narration")

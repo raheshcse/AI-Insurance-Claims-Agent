@@ -44,8 +44,8 @@ from conversation.store import ConversationRepository
 logger = logging.getLogger("claims.assistant")
 
 OPENING_MESSAGE = (
-    "Hello. I'm the Northwind claims assistant. Tell me what happened in your "
-    "own words and I'll help you report it — you don't need to fill in a form."
+    "Hello! I'm your insurance claims assistant. Tell me what happened, and "
+    "I'll help you report it."
 )
 
 

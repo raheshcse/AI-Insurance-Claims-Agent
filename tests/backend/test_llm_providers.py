@@ -625,7 +625,10 @@ def test_a_missing_key_says_so_instead_of_just_degrading(monkeypatch):
     assert result.provider == "gemini"
 
 
-def test_an_unreachable_endpoint_is_reported_as_a_transport_error():
+def test_an_unreachable_endpoint_names_the_connection_as_the_problem():
+    """Was `transport_error`, which is what made this whole class of failure
+    undiagnosable. A connection that never opened is now its own reason, and
+    distinct from a request Google received and refused."""
     def refuse(_request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
@@ -635,7 +638,8 @@ def test_an_unreachable_endpoint_is_reported_as_a_transport_error():
     result = provider.narrate(REQUEST)
 
     assert result.degraded is True
-    assert result.degraded_reason == DegradedReason.TRANSPORT_ERROR
+    assert result.degraded_reason == DegradedReason.CONNECTION_FAILED
+    assert result.degraded_reason != DegradedReason.AUTH_REJECTED
 
 
 def test_a_failed_interaction_status_is_distinguishable_from_a_dead_endpoint():
@@ -703,3 +707,204 @@ def test_a_successful_call_carries_no_reason():
 
     assert result.degraded is False
     assert result.degraded_reason is None
+
+
+# ---------------------------------------------------------------------------
+# 11. A failure has to name itself.
+#
+# Every failure used to come back as `transport_error`: a wrong key, a wrong
+# model, a quota wall, a DNS failure and a corporate proxy were indistinguishable
+# from the outside. That is why "it is not connecting to Gemini" was a question
+# nobody could answer without reading a server log.
+# ---------------------------------------------------------------------------
+
+
+def _at_status(code: int) -> tuple[str | None, int | None]:
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(code, json={"error": {"message": "…"}})
+        ),
+    )
+    result = provider.narrate(REQUEST)
+    return result.degraded_reason, result.http_status
+
+
+@pytest.mark.parametrize(
+    "code, expected",
+    [
+        (400, DegradedReason.BAD_REQUEST),
+        (401, DegradedReason.AUTH_REJECTED),
+        (403, DegradedReason.AUTH_REJECTED),
+        (404, DegradedReason.NOT_FOUND),
+        (429, DegradedReason.RATE_LIMITED),
+        (500, DegradedReason.PROVIDER_ERROR),
+        (503, DegradedReason.PROVIDER_ERROR),
+    ],
+)
+def test_each_http_status_maps_to_its_own_reason(code, expected):
+    reason, status = _at_status(code)
+
+    assert reason == expected
+    assert status == code, "the status is reported; a status is not a credential"
+
+
+def test_a_wrong_key_and_a_wrong_model_are_distinguishable():
+    """The distinction that matters most when an integration will not start.
+
+    401 says "fix your key". 404 says "fix your model or base URL". Collapsing
+    them into one code is what makes the difference undiagnosable.
+    """
+    assert _at_status(401)[0] != _at_status(404)[0]
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (httpx.ReadTimeout("slow"), DegradedReason.TIMEOUT),
+        (httpx.ConnectError("no route"), DegradedReason.CONNECTION_FAILED),
+        (httpx.ProxyError("blocked"), DegradedReason.CONNECTION_FAILED),
+    ],
+)
+def test_transport_failures_are_distinguished_from_rejections(exc, expected):
+    def raise_it(_request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY, transport=httpx.MockTransport(raise_it)
+    )
+    result = provider.narrate(REQUEST)
+
+    assert result.degraded_reason == expected
+    assert result.http_status is None, "nothing answered, so there is no status"
+
+
+def test_a_non_json_body_is_its_own_reason():
+    """Usually a proxy or captive portal answering instead of the API."""
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY,
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, text="<html>Sign in to the network</html>")
+        ),
+    )
+
+    assert provider.narrate(REQUEST).degraded_reason == DegradedReason.INVALID_JSON
+
+
+def test_a_failed_request_still_reports_gemini_as_the_provider():
+    """The whole point of the distinction the brief asks for.
+
+    `LLM_PROVIDER=gemini` with a broken key must never be reported as
+    "provider: stub", because that reads as a deliberate choice rather than as
+    a fault. The provider stays `gemini`; `degraded` carries the failure.
+    """
+    reason, _ = _at_status(401)
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY,
+        transport=httpx.MockTransport(lambda r: httpx.Response(401, json={})),
+    )
+    result = provider.narrate(REQUEST)
+
+    assert result.provider == "gemini", "selection is not success, and not the reverse"
+    assert result.degraded is True
+    assert reason == DegradedReason.AUTH_REJECTED
+
+
+def test_no_reason_or_status_can_leak_the_key():
+    """A status code and a fixed code are safe. A response body is not."""
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY,
+        transport=httpx.MockTransport(
+            # A hostile body that quotes the request back, as some gateways do.
+            lambda r: httpx.Response(400, json={"error": {"message": FAKE_KEY}})
+        ),
+    )
+
+    result = provider.narrate(REQUEST)
+
+    assert FAKE_KEY not in (result.degraded_reason or "")
+    assert FAKE_KEY not in result.text
+    assert FAKE_KEY not in str(result.http_status)
+
+
+# ---------------------------------------------------------------------------
+# 12. Structured output — asked for, not scraped back.
+# ---------------------------------------------------------------------------
+
+
+def test_a_response_schema_becomes_response_format():
+    """Verified against Google's reference for POST /v1beta/interactions."""
+    seen: dict = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": "completed", "output_text": "{}"})
+
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}}
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY, transport=httpx.MockTransport(capture)
+    )
+    provider.narrate(
+        NarrationRequest(
+            purpose="p", facts={"headline": "h"}, max_words=10, response_schema=schema
+        )
+    )
+
+    assert seen["response_format"] == {
+        "type": "text",
+        "mime_type": "application/json",
+        "schema": schema,
+    }
+
+
+def test_no_schema_means_no_response_format():
+    """A prose request must not suddenly demand JSON."""
+    seen: dict = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": "completed", "output_text": "hi"})
+
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY, transport=httpx.MockTransport(capture)
+    )
+    provider.narrate(REQUEST)
+
+    assert "response_format" not in seen
+
+
+def test_the_request_still_matches_the_documented_interactions_contract():
+    """The whole body, against Google's published field list.
+
+    POST /v1beta/interactions with `model`, `input` (a plain string is
+    accepted), `system_instruction`, `generation_config`, and the
+    `x-goog-api-key` header.
+    """
+    seen: dict = {}
+
+    def capture(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["auth_header"] = "x-goog-api-key" in request.headers
+        seen["bearer"] = "authorization" in request.headers
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"status": "completed", "output_text": "ok"})
+
+    provider = GeminiLLMProvider(
+        api_key=FAKE_KEY, transport=httpx.MockTransport(capture)
+    )
+    provider.narrate(REQUEST)
+
+    assert seen["url"].endswith("/v1beta/interactions")
+    assert seen["auth_header"] is True
+    assert seen["bearer"] is False, "Bearer is OpenAI's header, not Google's"
+    assert set(seen["body"]) == {
+        "model",
+        "input",
+        "system_instruction",
+        "generation_config",
+    }
+    assert isinstance(seen["body"]["input"], str)
+    assert set(seen["body"]["generation_config"]) == {
+        "temperature",
+        "max_output_tokens",
+    }

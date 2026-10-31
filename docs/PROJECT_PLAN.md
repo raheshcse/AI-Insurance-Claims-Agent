@@ -766,7 +766,7 @@ through.
 
 | File | Role |
 | --- | --- |
-| `src/App.jsx` | Shell: masthead, main, footer. Fictional insurer branding ("Northwind Home Insurance") |
+| `src/App.jsx` | Shell: masthead, main, footer. No insurer branding — the masthead reads "Insurance Claims" |
 | `src/claim/ClaimWizard.jsx` | Step state machine, validation gating, submission, error state |
 | `src/claim/claimForm.js` | Form shape, API payload mapping, emergency-signal helper |
 | `src/claim/validation.js` | Client-side rules, mirroring the backend |

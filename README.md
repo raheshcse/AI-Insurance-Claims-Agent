@@ -778,12 +778,14 @@ AI_Insurance_Claims_Agent/
 │   │   └── repositories/        claim, analysis, review_queue, reference_data
 │   ├── agents/                  intake, policy, validation, assessment, fraud_risk,
 │   │                            conversation (Phase 5) + contracts
-│   ├── conversation/            Phase 5 — contracts, fields (validation), builder, store
+│   ├── conversation/            Phase 5 — contracts, fields (validation),
+│   │                            extraction (deterministic reading), builder, store
 │   ├── graph/                   builder, state, nodes, escalation, governed, finalize,
 │   │                            conversation_graph (Phase 5)
 │   ├── routing/                 rules, router, contracts
 │   ├── bootstrap.py             loads .env before anything reads os.environ
-│   └── llm/                     base, stub, gemini_provider, http_provider, factory, verify_cli
+│   └── llm/                     base, stub, gemini_provider, ollama_provider,
+│                                http_provider, factory, verify_cli
 │
 ├── frontend/src/
 │   ├── App.jsx                  shell; claims assistant ⇄ claim form ⇄ claims console
@@ -904,12 +906,54 @@ Diagnostics report *existence*, not value:
 `.env` and `.env.*` are gitignored (`.env.example` excepted); `.env.example`
 carries placeholders only.
 
-A failure is reported, not hidden. When Gemini cannot answer, the provider keeps
-reporting itself as `gemini` with `degraded: true` plus a fixed reason code —
-`api_key_not_configured`, `transport_error`, `unusable_interaction_status` or
-`empty_response_text` — which reaches the console beside the provider name.
-Rewriting the provider to `stub` on failure is what made a configuration problem
-look like a deliberate choice of provider.
+### A failure names itself
+
+When Gemini cannot answer, the provider keeps reporting itself as `gemini` with
+`degraded: true` plus a fixed reason code and, where Google answered, the HTTP
+status. Rewriting the provider to `stub` on failure is what made a
+configuration problem look like a deliberate choice of provider.
+
+Three facts are published separately and never collapsed into one:
+
+| | |
+| --- | --- |
+| `provider_selected` | what configuration chose — `gemini` |
+| `request_succeeded` | whether that provider actually answered |
+| `degraded` | whether the deterministic fallback wrote the result |
+
+The reason codes, each mapping to one action:
+
+| Code | HTTP | What to do |
+| --- | --- | --- |
+| `api_key_not_configured` | — | Set `GEMINI_API_KEY` in `.env` |
+| `auth_rejected_401_403` | 401/403 | Key wrong, revoked, restricted, or API not enabled |
+| `endpoint_or_model_not_found_404` | 404 | Check `GEMINI_MODEL` and `GEMINI_BASE_URL` |
+| `rate_limited_429` | 429 | Quota. The integration is fine |
+| `request_rejected_400` | 400 | The body was refused — a bug here, not in config |
+| `provider_server_error_5xx` | 5xx | Google's side |
+| `network_timeout` | — | No answer in time |
+| `connection_failed` | — | DNS, TLS, firewall or proxy. Nothing reached Google |
+| `response_not_json` | 200 | A proxy answered instead of the API |
+| `unusable_interaction_status` | 200 | A status carrying no result |
+| `empty_response_text` | 200 | Safety filter |
+
+These were **one** code until they were separated. Every failure — a wrong key,
+a wrong model, a quota wall, a DNS failure, a corporate proxy — came back as
+`transport_error`, so the only honest thing anyone could say about a broken
+integration was "it did not work", and diagnosing it meant reading a server log
+for an exception class name.
+
+### Is it actually reaching Gemini?
+
+```powershell
+python -m llm.verify_cli --live          # one minimal probe, no claim data
+python -m llm.verify_cli --live --json   # exit 0 = a live model answered
+```
+
+`--live` sends "Respond with exactly: GEMINI_CONNECTION_OK" and nothing else —
+no customer information, no claim, no policy detail — so it is safe to run
+against a real key. It reports the reason code, the HTTP status and the one
+action to take. The key is never printed in any mode.
 
 ## 22. Run the backend
 
@@ -1019,7 +1063,7 @@ python -m pytest        # backend — 262 tests
 cd frontend; npm test   # frontend — 59 tests
 ```
 
-**Backend (333).**
+**Backend (439).**
 
 | File | Tests | Covers |
 | --- | --- | --- |
@@ -1030,10 +1074,12 @@ cd frontend; npm test   # frontend — 59 tests
 | `test_intelligence_api.py` | 10 | The analysis endpoints and their boundaries |
 | `test_routing.py` | 28 | The twelve routing scenarios and the rule catalogue |
 | `test_review_api.py` | 23 | The queue, the review screen, the four actions |
-| **`test_llm_providers.py`** | **50** | **Phase 4A — the Gemini provider, its boundary, and why it degraded** |
+| **`test_llm_providers.py`** | **67** | **Phase 4A — the Gemini provider, its boundary, and how each failure names itself** |
+| **`test_ollama_provider.py`** | **32** | **Ollama as a local provider behind the same boundary** |
 | **`test_llm_governance.py`** | **27** | **CP-13 — the LLM call as a governed commitment** |
 | **`test_governance.py`** | **65** | **Phase 4 — governance, including CP-14 and the dashboard** |
 | **`test_assistant.py`** | **51** | **Phase 5 — the conversational assistant and its governed call** |
+| **`test_extraction.py`** | **56** | **Multi-field extraction, the address paragraph, and the real provider end to end** |
 
 The governance tests are organised around the ways a governance layer is usually faked — the
 constructs are checked with `type(x) is vsl_constructs.PreNode` (a duck-typed mock would pass
@@ -1344,10 +1390,47 @@ customer's name. A reply can only answer a question that was actually put.
 
 | Layer | Job | Can it write a claim value? |
 | --- | --- | --- |
-| Gemini | read a sentence, propose structured values | **No** |
+| `conversation/extraction.py` | read structure out of the sentence — patterns, no model | **No** |
+| Gemini | read *meaning* out of the sentence, propose values | **No** |
 | `conversation/fields.py` | validate each proposal deterministically | **Yes — the only writer** |
 | INV-05 | reject output carrying values the customer never said | **No — it can only refuse** |
 | the catalogue | derive what is still missing | **No** |
+
+### Extraction is deterministic first, model second
+
+Multi-field understanding is a property of the **system**, not a capability of
+whichever provider happens to be configured. `conversation/extraction.py` reads
+a message with patterns — no model, no network, no key — and the model's
+proposals are merged on top of it. Where both spoke, the patterns win: a regex
+that matched `john@example.com` is certain by construction, and a model
+proposing something different for the same text has either misread it or
+invented it.
+
+Three tiers, in order:
+
+| | Example | Taken? |
+| --- | --- | --- |
+| **Labelled** | "my email is X" | Yes — the customer said what it is |
+| **Unambiguous shape** | `john@example.com`, `0211234567`, `POL-HOME-20117`, `$7,500` | Yes — nothing else looks like that |
+| **Everything else** | "John Smith" | **No** — any text could be a name |
+
+That last row is the rule the module exists to obey: *never assume which field
+a value belongs to unless the text says so or the shape is unambiguous*. What
+is left over after the identifiable values are removed is offered **only** to
+the field the assistant actually asked about — an inference the design supports
+because we know what was asked — and never to a field nobody asked about.
+
+**The defect this fixed.** The fallback path used to hand the entire raw
+message to the validator for whichever field had just been asked about. So
+
+> "My name is John Smith, my email is john@example.com, my phone is
+> 0211234567, and my policy number is POL-HOME-20117."
+
+was offered to `validate_full_name`, which checks length and "contains a
+letter" — and at 116 characters it **passed**, storing the whole sentence as
+the customer's name. One character longer and it failed instead, with "That
+name is longer than our system can accept". No validator was changed and no
+limit was raised to fix it: the input reaching them is simply the right input.
 
 So the worst a broken, jailbroken or hallucinating model can do is propose
 nonsense, which is rejected, or propose nothing, which leaves the field missing

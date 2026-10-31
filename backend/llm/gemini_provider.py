@@ -74,7 +74,13 @@ from typing import Any
 
 import httpx
 
-from llm.base import SYSTEM_PROMPT, DegradedReason, NarrationRequest, NarrationResult
+from llm.base import (
+    SYSTEM_PROMPT,
+    DegradedReason,
+    NarrationRequest,
+    NarrationResult,
+    reason_for_status,
+)
 from llm.stub import StubLLMProvider
 
 logger = logging.getLogger("claims.llm")
@@ -150,9 +156,45 @@ class GeminiLLMProvider:
 
         try:
             payload = self._post(request)
+        except httpx.HTTPStatusError as exc:
+            # Google answered and said no. The STATUS is the diagnosis, and a
+            # status code is not a credential -- so it is reported, while the
+            # response body (which can quote the request back) never is.
+            code = exc.response.status_code
+            reason = reason_for_status(code)
+            logger.warning(
+                "Gemini rejected the request with HTTP %s (%s); falling back to "
+                "deterministic narration.",
+                code,
+                reason,
+            )
+            return self._degraded(request, reason, http_status=code)
+        except httpx.TimeoutException:
+            logger.warning(
+                "Gemini did not answer within %.0fs; falling back to deterministic "
+                "narration.",
+                self._timeout,
+            )
+            return self._degraded(request, DegradedReason.TIMEOUT)
+        except (httpx.ConnectError, httpx.ProxyError, httpx.ConnectTimeout) as exc:
+            logger.warning(
+                "Gemini could not be reached (%s); falling back to deterministic "
+                "narration.",
+                exc.__class__.__name__,
+            )
+            return self._degraded(request, DegradedReason.CONNECTION_FAILED)
+        except ValueError:
+            # A 2xx whose body would not parse -- typically a proxy or captive
+            # portal answering instead of the API.
+            logger.warning(
+                "Gemini returned a non-JSON body; falling back to deterministic "
+                "narration."
+            )
+            return self._degraded(request, DegradedReason.INVALID_JSON)
         except Exception as exc:  # noqa: BLE001 - narration must never raise
-            # Class name only. An exception's string form can carry a URL, and a
-            # URL is one careless refactor away from carrying a key.
+            # The genuine catch-all, and it stays LAST. Class name only: an
+            # exception's string form can carry a URL, and a URL is one careless
+            # refactor away from carrying a key.
             logger.warning(
                 "Gemini narration failed (%s); falling back to deterministic narration.",
                 exc.__class__.__name__,
@@ -202,8 +244,13 @@ class GeminiLLMProvider:
         return response.json()
 
     def build_request_body(self, request: NarrationRequest) -> dict[str, Any]:
-        """The Interactions API request. Public so a test can assert its shape."""
-        return {
+        """The Interactions API request. Public so a test can assert its shape.
+
+        Verified against Google's own reference for POST /v1beta/interactions:
+        `model`, `input` (a plain string is accepted), `system_instruction`,
+        `generation_config`, and `response_format` for structured output.
+        """
+        body: dict[str, Any] = {
             "model": self.model,
             "system_instruction": request.system_instruction or SYSTEM_PROMPT,
             "input": _user_message(request),
@@ -213,7 +260,20 @@ class GeminiLLMProvider:
             },
         }
 
-    def _degraded(self, request: NarrationRequest, reason: str) -> NarrationResult:
+        # Structured output, when the caller wants JSON rather than prose.
+        # Asking for it beats scraping it back out of a code fence afterwards.
+        if request.response_schema:
+            body["response_format"] = {
+                "type": "text",
+                "mime_type": "application/json",
+                "schema": request.response_schema,
+            }
+
+        return body
+
+    def _degraded(
+        self, request: NarrationRequest, reason: str, *, http_status: int | None = None
+    ) -> NarrationResult:
         """Deterministic prose, labelled as such, WITH the reason it happened.
 
         `degraded=True` is what reaches the report as `narrative_source:
@@ -232,6 +292,7 @@ class GeminiLLMProvider:
             model=self.model,
             degraded=True,
             degraded_reason=reason,
+            http_status=http_status,
         )
 
 

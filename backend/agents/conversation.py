@@ -89,6 +89,42 @@ INV-05 checks the output before it is used. A prompt is guidance; the validator
 and the Invariant are the enforcement."""
 
 
+EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "extracted": {
+            "type": "object",
+            "description": (
+                "Only the fields the message actually states. Omit everything else."
+            ),
+            "properties": {name: {} for name in EXTRACTABLE_FIELDS},
+        },
+        "uncertain": {
+            "type": "object",
+            "description": (
+                "Fields the customer mentioned but did not pin down, mapped to "
+                "their own words."
+            ),
+            "properties": {name: {"type": "string"} for name in EXTRACTABLE_FIELDS},
+        },
+    },
+    "required": ["extracted", "uncertain"],
+}
+"""What the model is asked to return, as a schema rather than as a hope.
+
+Two things it buys, and the second is the one that mattered:
+
+1. The reply parses. A model that wraps JSON in a code fence, or opens with
+   "Here is the JSON:", used to have its whole answer discarded by the parser.
+2. The field names are pinned to the catalogue. A schema listing exactly the
+   extractable fields is a much stronger hint than a sentence in a prompt
+   asking nicely for the same thing.
+
+It is a request, not a guarantee. `parse_extraction` still copes with prose,
+every value still goes through `conversation/fields.py`, and INV-05 still judges
+the output. A schema improves the odds; it is not a control."""
+
+
 _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 
@@ -161,6 +197,16 @@ class ConversationAgent:
     def __init__(self, llm: LLMProvider) -> None:
         self._llm = llm
 
+    @property
+    def provider_name(self) -> str:
+        """Which provider CONFIGURATION selected -- not whether it answered.
+
+        Published beside `request_succeeded` so the two can never be confused.
+        A Gemini provider that degraded still reports `gemini` here, because
+        that is what was selected, and pretending otherwise is what made a
+        broken key look like a deliberate choice of the stub."""
+        return getattr(self._llm, "name", "unknown")
+
     # -- what the gate calls ----------------------------------------------
 
     def build_request(
@@ -184,6 +230,7 @@ class ConversationAgent:
             },
             max_words=400,
             system_instruction=EXTRACTION_INSTRUCTION,
+            response_schema=EXTRACTION_SCHEMA,
         )
 
     def extract(self, request: NarrationRequest) -> Any:

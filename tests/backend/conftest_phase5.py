@@ -138,13 +138,29 @@ def complete_conversation(assistant: AssistantService):
     def run() -> str:
         turn = assistant.start()
         conversation_id = turn.conversation.conversation_id
-        # The customer speaks first, in their own words. The assistant has not
-        # asked about a field yet, so nothing is collected from this -- which is
-        # the correct behaviour and the reason the opening turn is here rather
-        # than being skipped: a reply can only answer a question that was put.
-        turn = assistant.send(conversation_id, "A storm damaged my roof last night.")
-        for _, answer in ANSWERS:
-            turn = assistant.send(conversation_id, answer)
+
+        # The customer speaks first, in their own words.
+        turn = assistant.send(
+            conversation_id, "A storm damaged my roof and ceiling last night."
+        )
+
+        # Then ANSWER WHAT IS ASKED, rather than replaying a fixed script.
+        #
+        # The fixture used to send `ANSWERS` positionally, which quietly assumed
+        # the assistant collects one field per turn in catalogue order. It does
+        # not any more: deterministic extraction can fill several fields from
+        # one sentence, including from the opening message, so a positional
+        # script drifts out of step and starts feeding answers to the wrong
+        # questions. Reading the next missing field is both more robust and
+        # closer to what a customer actually does.
+        answers = dict(ANSWERS)
+        for _ in range(len(ANSWERS) + 5):
+            if turn.conversation.claim_ready:
+                break
+            pending = turn.conversation.missing_information[0].field
+            assert pending in answers, f"the fixture has no answer for {pending}"
+            turn = assistant.send(conversation_id, answers[pending])
+
         assert turn.conversation.claim_ready, (
             "the fixture must reach readiness; missing: "
             f"{[m.field for m in turn.conversation.missing_information]}"

@@ -51,6 +51,19 @@ class NarrationRequest:
     Whatever is set here, a provider still applies its own refusal rules; this
     replaces the task instruction, not the safety of the boundary."""
 
+    response_schema: dict | None = None
+    """Ask the provider for JSON matching this schema, rather than prose.
+
+    Added because the conversational assistant asks the model for a structured
+    proposal and then had to SCRAPE it out of whatever came back -- a model that
+    wrapped its answer in a code fence, or prefixed "Here is the JSON:", was a
+    model whose answer got thrown away. The Interactions API supports
+    `response_format`, so asking properly is both more reliable and less code.
+
+    Providers that cannot honour it ignore it and return prose; the caller's
+    parser still has to cope, because a schema is a request rather than a
+    guarantee. It changes the odds, not the contract."""
+
 
 @dataclass(frozen=True)
 class NarrationResult:
@@ -59,6 +72,12 @@ class NarrationResult:
     model: str | None = None
     degraded: bool = False
     """True when the provider could not be reached and a fallback was used."""
+
+    http_status: int | None = None
+    """The HTTP status Google returned, when it returned one.
+
+    A status code is not a credential and is the single most useful fact about
+    a failed integration. `None` means the request never got a response."""
 
     degraded_reason: str | None = None
     """A short, credential-free explanation of WHY the provider degraded.
@@ -83,9 +102,62 @@ class DegradedReason:
     NOT_CONFIGURED = "api_key_not_configured"
     """`GEMINI_API_KEY` is empty or unset. Nothing was sent."""
 
+    # -- the request never reached Google, or never came back ----------------
+
+    TIMEOUT = "network_timeout"
+    """No response inside `GEMINI_REQUEST_TIMEOUT_SECONDS`."""
+
+    CONNECTION_FAILED = "connection_failed"
+    """DNS, TLS, proxy or routing. The request did not reach the API."""
+
     TRANSPORT_ERROR = "transport_error"
-    """The request could not be completed -- DNS, TLS, proxy, timeout, or a
-    non-2xx status. The exception class name is logged; nothing more."""
+    """Something else went wrong in transport. The catch-all, and deliberately
+    the LAST resort rather than the first: see the note below."""
+
+    # -- Google answered, and said no ----------------------------------------
+
+    BAD_REQUEST = "request_rejected_400"
+    """The API understood the request and refused it. Almost always a malformed
+    body or an unsupported field."""
+
+    AUTH_REJECTED = "auth_rejected_401_403"
+    """The key is missing, wrong, revoked, restricted to other referrers/IPs, or
+    the API is not enabled for its project. A CONFIGURATION problem, not a
+    network one."""
+
+    NOT_FOUND = "endpoint_or_model_not_found_404"
+    """The endpoint path or the model name does not exist. `GEMINI_MODEL` and
+    `GEMINI_BASE_URL` are the two things to check."""
+
+    RATE_LIMITED = "rate_limited_429"
+    """Quota or rate limit. The integration is correct; there is no headroom."""
+
+    PROVIDER_ERROR = "provider_server_error_5xx"
+    """Google's side. Nothing in this project is wrong."""
+
+    INVALID_JSON = "response_not_json"
+    """A 2xx whose body would not parse. Usually a proxy or captive portal
+    answering instead of the API."""
+
+    # WHY THESE ARE SEPARATE
+    #
+    # They used to be one value. Every failure -- a wrong key, a wrong model, a
+    # quota wall, a DNS failure, a corporate proxy -- came back as
+    # `transport_error`, so the only honest thing anyone could say about a
+    # broken integration was "it did not work". Diagnosing it meant reading the
+    # server log for an exception class name, which is not a thing a person
+    # should have to do to learn that their API key is wrong.
+    #
+    # Each value above maps to one action. None of them carries a credential:
+    # an HTTP status is not a secret, and the response body -- which can quote
+    # the request -- is never included.
+
+    MODEL_NOT_FOUND = "model_not_found"
+    """The server answered but does not have the model.
+
+    Distinct from `endpoint_or_model_not_found_404` because for a LOCAL server
+    the two are not the same problem at all: the server is plainly there, and
+    the fix is `ollama pull <model>` rather than anything about configuration."""
 
     UNUSABLE_STATUS = "unusable_interaction_status"
     """The Interactions API answered, but with a status that carries no answer
@@ -93,6 +165,28 @@ class DegradedReason:
 
     EMPTY_RESPONSE = "empty_response_text"
     """A 200 with no text in it -- typically a safety filter."""
+
+
+def reason_for_status(code: int, *, not_found: str | None = None) -> str:
+    """Turn an HTTP status into one of the fixed, safe reason codes.
+
+    Shared by every HTTP-speaking provider so a 401 means the same thing
+    whichever one returned it. `not_found` lets a provider say what a 404
+    actually means for IT: for a hosted API it is "wrong endpoint or model";
+    for a local server that plainly answered, it is "you have not pulled the
+    model", which is a different sentence and a different fix.
+    """
+    if code in (401, 403):
+        return DegradedReason.AUTH_REJECTED
+    if code == 404:
+        return not_found or DegradedReason.NOT_FOUND
+    if code == 429:
+        return DegradedReason.RATE_LIMITED
+    if 500 <= code < 600:
+        return DegradedReason.PROVIDER_ERROR
+    if 400 <= code < 500:
+        return DegradedReason.BAD_REQUEST
+    return DegradedReason.TRANSPORT_ERROR
 
 
 @runtime_checkable

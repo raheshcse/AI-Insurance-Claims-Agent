@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -122,18 +123,26 @@ def test_one_message_can_carry_several_facts(assistant, provider):
 
 
 def test_missing_information_is_detected_and_named(assistant):
-    """REQUIREMENT 6. Derived from the catalogue, never remembered."""
+    """REQUIREMENT 6. Derived from the catalogue, never remembered.
+
+    Asserted as a relationship between what is collected and what is missing,
+    rather than as a count. A count assumed one field per turn, which stopped
+    being true once deterministic extraction could read several facts out of one
+    sentence -- the opening message alone now yields a date and a damaged area.
+    """
     conversation_id = assistant.start().conversation.conversation_id
-    # The customer's opening message is free text; the assistant then asks for
-    # a name, and THAT is the reply this test is about.
     assistant.send(conversation_id, "A storm damaged my roof last night.")
     turn = assistant.send(conversation_id, "Marama Whitcombe")
 
     missing = {item.field for item in turn.conversation.missing_information}
+    collected = {item.field for item in turn.conversation.collected_information}
 
     assert "full_name" not in missing, "it was just collected"
+    assert "full_name" in collected
     assert "policy_number" in missing
-    assert len(missing) == len(REQUIRED_FIELDS) - 1
+    # Every required field is in exactly one of the two sets, always.
+    assert missing | collected >= set(REQUIRED_FIELDS)
+    assert missing.isdisjoint(collected)
     assert all(item.question for item in turn.conversation.missing_information)
 
 
@@ -413,7 +422,12 @@ def test_the_created_claim_carries_what_the_customer_actually_said(
 
     assert fnol["customer"]["full_name"] == "Marama Whitcombe"
     assert fnol["customer"]["policy_number"] == "POL-HOME-20117"
-    assert fnol["damage"]["date_of_loss"] == "2026-09-14"
+    # "…last night" in the opening message, resolved deterministically. Asserted
+    # against a computed date rather than a literal, because a hard-coded one
+    # is only correct on the day it was written.
+    assert fnol["damage"]["date_of_loss"] == (
+        datetime.now(timezone.utc).date() - timedelta(days=1)
+    ).isoformat()
     assert fnol["damage"]["customer_estimated_value"] == 7500.0
     assert fnol["damage"]["peril"] == "storm"
     assert fnol["property"]["loss_address"]["postcode"] == "0604"
@@ -559,7 +573,15 @@ def test_an_invariant_violation_blocks_the_output_from_downstream(assistant, pro
     assert turn.governance["llm_called"] is True
     assert turn.governance["output_accepted"] is False
     assert turn.governance["terminal_state"] == "claim-automation-suspended"
-    assert turn.conversation.collected_information == []
+
+    # The MODEL'S value is what must not have landed. Asserting an empty state
+    # would be asserting something else entirely: "The roof is damaged" also
+    # yields a damaged area by pattern, which never went near the model and is
+    # not what the Invariant rejected. A test that conflated the two would fail
+    # for a correct reason and be "fixed" by weakening the extractor.
+    collected = {item.field for item in turn.conversation.collected_information}
+    assert "policy_number" not in collected, "the rejected output must not land"
+    assert collected <= {"damaged_areas"}
 
 
 def test_the_gate_never_hands_back_output_it_rejected(assistant):
